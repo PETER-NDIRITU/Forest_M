@@ -1,0 +1,252 @@
+// Clear the map and remove UI elements
+Map.clear();
+
+// Import necessary datasets
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2');
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD');
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY');
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
+var modisNDVI = ee.ImageCollection('MODIS/006/MOD13A1');
+var modisLST = ee.ImageCollection('MODIS/006/MOD11A2');
+var soilData = ee.Image('OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02');
+
+// Define the study area
+var studyArea = ee.Geometry.Polygon([[
+  [-120.40, 37.60],
+  [-120.40, 36.40],
+  [-119.00, 36.40],
+  [-119.00, 37.60]
+]]);
+
+// Function to mask clouds from Sentinel-2 imagery
+function maskS2clouds(image) {
+  var cloudBitMask = ee.Number(2).pow(10).int();
+  var cirrusBitMask = ee.Number(2).pow(11).int();
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+// Load and preprocess datasets
+var s2Collection = sentinel2
+  .filterBounds(studyArea)
+  .filterDate('2018-01-01', '2021-12-31')
+  .map(maskS2clouds)
+  .median();
+
+var s1Collection = sentinel1
+  .filterBounds(studyArea)
+  .filterDate('2018-01-01', '2021-12-31')
+  .select(['VV', 'VH'])
+  .median();
+
+var combinedImage = s2Collection.addBands(s1Collection);
+
+// Create training dataset for clustering
+var training = combinedImage.sample({
+  region: studyArea,
+  scale: 30,
+  numPixels: 5000
+});
+
+// Instantiate the clusterer and train it
+var clusterer = ee.Clusterer.wekaKMeans(15).train(training);
+
+// Cluster the input using the trained clusterer
+var clustered = combinedImage.cluster(clusterer);
+
+// Calculate LULC percentage coverage
+var areaImage = ee.Image.pixelArea().addBands(clustered).clip(studyArea);
+
+var coverage = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'class'
+  }),
+  geometry: studyArea,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+print('LULC Coverage:', coverage);
+
+// Add UI elements
+var panel = ui.Panel({style: {width: '400px', height: '80%', position: 'top-left'}});
+
+var intro = ui.Label('Deforestation and Forest Degradation Monitoring', {fontWeight: 'bold', fontSize: '18px'});
+panel.add(intro);
+
+var selectAreaButton = ui.Button('Draw Area', function() {
+  Map.drawingTools().setShape('polygon');
+  Map.drawingTools().draw();
+});
+
+panel.add(selectAreaButton);
+
+var startDateLabel = ui.Label('Start Date');
+var startDate = ui.Textbox('2018-01-01');
+panel.add(startDateLabel);
+panel.add(startDate);
+
+var endDateLabel = ui.Label('End Date');
+var endDate = ui.Textbox('2021-12-31');
+panel.add(endDateLabel);
+panel.add(endDate);
+
+var analyzeButton = ui.Button('Analyze', function() {
+  var drawnArea = Map.drawingTools().layers().get(0).toGeometry();
+  var start = ee.Date(startDate.getValue());
+  var end = ee.Date(endDate.getValue());
+  
+  var filteredS2 = sentinel2
+    .filterBounds(drawnArea)
+    .filterDate(start, end)
+    .map(maskS2clouds)
+    .median()
+    .clip(drawnArea);
+  
+  var filteredS1 = sentinel1
+    .filterBounds(drawnArea)
+    .filterDate(start, end)
+    .select(['VV', 'VH'])
+    .median()
+    .clip(drawnArea);
+  
+  var combinedFilteredImage = filteredS2.addBands(filteredS1);
+  
+  var trainingFiltered = combinedFilteredImage.sample({
+    region: drawnArea,
+    scale: 30,
+    numPixels: 5000
+  });
+
+  var clusteredFiltered = combinedFilteredImage.cluster(clusterer);
+
+  Map.addLayer(clusteredFiltered.randomVisualizer(), {}, 'LULC Classification');
+  
+  var areaImageFiltered = ee.Image.pixelArea().addBands(clusteredFiltered).clip(drawnArea);
+  var coverageFiltered = areaImageFiltered.reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class'
+    }),
+    geometry: drawnArea,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  
+  print('LULC Coverage for Selected Area:', coverageFiltered);
+  
+  var ndviCollection = modisNDVI
+    .filterBounds(drawnArea)
+    .filterDate(start, end)
+    .select('NDVI');
+  
+  var ndviChart = ui.Chart.image.series(ndviCollection, drawnArea, ee.Reducer.mean(), 500);
+  ndviChart.setOptions({
+    title: 'NDVI Trends',
+    vAxis: {title: 'NDVI'},
+    hAxis: {title: 'Date'},
+    series: {0: {color: 'green'}}
+  });
+  
+  panel.add(ndviChart);
+  
+  var chirpsCollection = chirps
+    .filterBounds(drawnArea)
+    .filterDate(start, end)
+    .select('precipitation');
+  
+  var rainfallChart = ui.Chart.image.series(chirpsCollection, drawnArea, ee.Reducer.mean(), 500);
+  rainfallChart.setOptions({
+    title: 'Rainfall Trends',
+    vAxis: {title: 'Rainfall (mm)'},
+    hAxis: {title: 'Date'},
+    series: {0: {color: 'blue'}}
+  });
+  
+  panel.add(rainfallChart);
+
+  // Add Sentinel-2 layer
+  Map.addLayer(filteredS2, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, 'Sentinel-2 Image');
+
+  // Add Sentinel-1 layer
+  Map.addLayer(filteredS1, {bands: ['VV'], min: -20, max: 0}, 'Sentinel-1 Image');
+  
+  // Add NDVI layer
+  var ndviImage = ndviCollection.median().clip(drawnArea);
+  Map.addLayer(ndviImage, {min: 0, max: 8000, palette: ['white', 'green']}, 'NDVI Image');
+  
+  // Add the drawn area to the map
+  Map.addLayer(drawnArea, {color: 'FF0000'}, 'Drawn Area');
+});
+
+panel.add(analyzeButton);
+
+Map.add(panel);
+Map.centerObject(studyArea, 8);
+
+// Prediction tool (example using a basic linear regression for NDVI trends)
+var predictionButton = ui.Button('Predict Forest Coverage', function() {
+  var drawnArea = Map.drawingTools().layers().get(0).toGeometry();
+  var ndviCollection = modisNDVI
+    .filterBounds(drawnArea)
+    .filterDate('2000-01-01', '2021-12-31')
+    .select('NDVI')
+    .mean()
+    .clip(drawnArea);
+  
+  var start = ee.Date(startDate.getValue());
+  var end = ee.Date(endDate.getValue());
+  
+  var ndviTimeSeries = modisNDVI
+    .filterBounds(drawnArea)
+    .filterDate(start, end)
+    .select('NDVI');
+  
+  var ndviTrend = ndviTimeSeries.reduce(ee.Reducer.linearFit()).clip(drawnArea);
+  
+  Map.addLayer(ndviTrend.select('scale'), {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI Trend');
+  
+  var degradationAreas = ndviTrend.select('scale').lt(0.0);
+  Map.addLayer(degradationAreas.mask(degradationAreas), {palette: 'red'}, 'High Degradation Areas');
+});
+
+panel.add(predictionButton);
+
+// Define a legend dictionary for the LULC classes.
+var lulcLegend = {
+  'Cluster 1': 'aec3d4',
+  'Cluster 2': '152106',
+  'Cluster 3': 'c3aa69',
+  'Cluster 4': '111149',
+  'Cluster 5': '7c8b39',
+  'Cluster 6': 'dba53d',
+  'Cluster 7': 'a1d3e2',
+  'Cluster 8': '588156',
+  'Cluster 9': 'e17d4e',
+  'Cluster 10': '7b7b7b',
+  'Cluster 11': 'e0d5a0',
+  'Cluster 12': 'd36b5c',
+  'Cluster 13': '9aa58d',
+  'Cluster 14': 'a6aad3',
+  'Cluster 15': '527c7c'
+};
+
+// Add the legend to the UI.
+var legendPanel = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legendPanel.add(ui.Label({value: 'LULC Legend', style: {fontWeight: 'bold'}}));
+
+Object.keys(lulcLegend).forEach(function(key) {
+  legendPanel.add(ui.Label({
+    value: key,
+    style: {
+      padding: '0 0 4px 8px',
+      backgroundColor: lulcLegend[key],
+      fontWeight: 'bold'
+    }
+  }));
+});
+
+Map.add(legendPanel);
+Map.centerObject(studyArea, 8);
